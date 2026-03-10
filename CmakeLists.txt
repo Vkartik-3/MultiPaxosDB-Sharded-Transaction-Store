@@ -1,0 +1,95 @@
+cmake_minimum_required(VERSION 3.20)
+project(tpc C CXX)
+include(common.cmake)
+
+# Proto file
+get_filename_component(tpc_proto "./src/proto/tpc.proto" ABSOLUTE)
+get_filename_component(tpc_proto_path "${tpc_proto}" PATH)
+
+# Generated sources
+set(tpc_proto_srcs "${CMAKE_CURRENT_BINARY_DIR}/tpc.pb.cc")
+set(tpc_proto_hdrs "${CMAKE_CURRENT_BINARY_DIR}/tpc.pb.h")
+set(tpc_grpc_srcs "${CMAKE_CURRENT_BINARY_DIR}/tpc.grpc.pb.cc")
+set(tpc_grpc_hdrs "${CMAKE_CURRENT_BINARY_DIR}/tpc.grpc.pb.h")
+add_custom_command(
+      OUTPUT "${tpc_proto_srcs}" "${tpc_proto_hdrs}" "${tpc_grpc_srcs}" "${tpc_grpc_hdrs}"
+      COMMAND ${_PROTOBUF_PROTOC}
+      ARGS --grpc_out "${CMAKE_CURRENT_BINARY_DIR}"
+        --cpp_out "${CMAKE_CURRENT_BINARY_DIR}"
+        -I "${tpc_proto_path}"
+        --plugin=protoc-gen-grpc="${_GRPC_CPP_PLUGIN_EXECUTABLE}"
+        "${tpc_proto}"
+      DEPENDS "${tpc_proto}")
+
+# Include generated *.pb.h files
+include_directories(${CMAKE_CURRENT_BINARY_DIR} 
+  ${CMAKE_CURRENT_SOURCE_DIR} 
+  "${CMAKE_CURRENT_SOURCE_DIR}/types"
+  "${CMAKE_CURRENT_SOURCE_DIR}/utils"
+  "${CMAKE_CURRENT_SOURCE_DIR}/client"
+  "${CMAKE_CURRENT_SOURCE_DIR}/server")
+
+# tpc_grpc_proto
+add_library(tpc_grpc_proto
+  ${tpc_grpc_srcs}
+  ${tpc_grpc_hdrs}
+  ${tpc_proto_srcs}
+  ${tpc_proto_hdrs})
+target_link_libraries(tpc_grpc_proto
+  absl::check
+  ${_REFLECTION}
+  ${_GRPC_GRPCPP}
+  ${_PROTOBUF_LIBPROTOBUF})
+
+# Add spdlog subdirectory
+add_subdirectory(spdlog)
+
+# Add leveldb subdirectory
+add_subdirectory(leveldb)
+
+# Add utils subdirectory
+add_subdirectory(src/utils)
+target_link_libraries(utils spdlog)
+
+# Gather all .cc files in the server directory
+file(GLOB_RECURSE SERVER_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/server/*.cc")
+
+# Build the server executable
+add_executable(server ${SERVER_SOURCES})
+target_link_libraries(server
+  tpc_grpc_proto
+  utils
+  absl::check
+  absl::flags
+  absl::flags_parse
+  absl::log
+  spdlog
+  leveldb
+  ${_REFLECTION}
+  ${_GRPC_GRPCPP}
+  ${_PROTOBUF_LIBPROTOBUF})
+
+# Gather all .cc files in the server directory
+file(GLOB_RECURSE CLIENT_SOURCES "${CMAKE_CURRENT_SOURCE_DIR}/src/client/*.cc")
+
+
+# Add client subdirectory
+add_subdirectory(src/client)
+target_link_libraries(client
+  tpc_grpc_proto
+  spdlog
+  utils
+  absl::check
+  absl::flags
+  absl::flags_parse
+  absl::log
+  ${_REFLECTION}
+  ${_GRPC_GRPCPP}
+  ${_PROTOBUF_LIBPROTOBUF})
+
+add_executable(driver "${CMAKE_CURRENT_SOURCE_DIR}/src/driver.cc")
+target_link_libraries(driver
+  client
+  utils
+  spdlog
+)
