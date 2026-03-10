@@ -60,7 +60,7 @@ For intra-shard transactions (both sender and receiver in the same cluster), the
 
 1. **Client → Leader**: Client sends `TransferReq(sender, receiver, amount)` to a randomly selected server in the relevant cluster.
 2. **Proposer checks preconditions**: No locks held on sender/receiver; sender balance ≥ amount.
-3. **Prepare phase**: Proposer sends `Prepare(ballot_num)` to all peers. Each peer responds with `Promise(ballot_num, accepted_ballot, accepted_val)` and synchronizes state if needed (the proposer/acceptor with the higher last-committed block catches up the other).
+3. **Prepare phase**: Proposer sends `Prepare(ballot_num)` to all peers. Each peer responds with `Promise(ballot_num, accepted_ballot, accepted_val)` and synchronizes state if needed (the server with the stale state pulls the missing committed entry from the proposer).
 4. **Accept phase**: On receiving a quorum of promises, proposer sends `Accept(ballot_num, txn)` to peers.
 5. **Commit phase**: On receiving a quorum of accepts, proposer commits, applies balance changes to LevelDB, writes an `IN_COMMIT` entry to the WAL, and replies to the client.
 
@@ -100,7 +100,7 @@ The client acts as the 2PC coordinator. Each involved cluster runs Paxos interna
 
 - Account balances are stored as `"client_id" → "balance"` string pairs.
 - The ballot number is stored as `"__ballot_num__" → "N"` for crash recovery.
-- On startup, balances are loaded from LevelDB (initialized to 10 if not found), then WAL metadata is replayed on top.
+- On startup, balances are loaded from LevelDB (initialized to 10 if not found (initial balance per account)), then WAL metadata is replayed on top.
 
 ### Write-Ahead Log (WAL)
 
@@ -132,7 +132,7 @@ This design eliminates data races entirely — no mutexes needed for in-memory s
 
 ### Networking
 
-All communication uses **gRPC with async completion queues** (`ClientAsyncResponseReader`). The client submits RPCs non-blocking and processes replies via `consumeReplies()` on a dedicated thread. The server uses bidirectional async streams for peer-to-peer Paxos messages.
+All communication uses **gRPC with async completion queues** (`ClientAsyncResponseReader`). The client submits RPCs non-blocking and processes replies via `consumeReplies()` on a dedicated thread. All peer-to-peer Paxos messages use unary RPCs.
 
 **RPC timeout**: Client-side deadline set to 10ms per RPC call. Unreachable servers are tracked and skipped.
 
@@ -226,8 +226,8 @@ Wall-clock throughput = `transactions_processed / (wall_end - wall_start)` in se
 `printPerformance()` outputs:
 - Total transactions, wall time, throughput (TPS)
 - Overall p50 and p99 latency
-- Intra-shard mean, p99
-- Cross-shard mean, p99
+- Intra-shard mean, p50, p99
+- Cross-shard mean, p50, p99
 
 ---
 
@@ -235,13 +235,13 @@ Wall-clock throughput = `transactions_processed / (wall_end - wall_start)` in se
 
 Benchmarks run on a single machine (macOS, Apple Silicon), 9 local server processes, 3 clusters × 3 servers each. Mix of intra-shard and cross-shard transactions from the test CSV.
 
-| Run | Txns | Wall (s) | TPS   | p50 (ms) | p99 (ms) | Intra Mean (ms) | Intra p99 (ms) | Cross Mean/p99 (ms) |
-|-----|------|----------|-------|----------|----------|-----------------|----------------|---------------------|
-| 1   | 102  | 2.86     | 35.65 | 98.08    | 483.63   | 78.23           | 483.63         | 146.91 / 525.61     |
-| 2   | 134  | 4.06     | 32.97 | 98.44    | 600.32   | 84.17           | 601.89         | 127.08 / 600.32     |
-| 3   | 124  | 3.18     | 38.96 | 160.61   | 946.43   | 108.40          | 971.28         | 247.01 / 946.43     |
-| 4   | 138  | 3.53     | 39.10 | 158.23   | 901.99   | 143.62          | 998.12         | 160.74 / 597.20     |
-| 5   | 128  | 3.11     | 41.14 | 215.45   | 1250.12  | 132.77          | 1257.04        | 294.16 / 1250.12    |
+| Run | Txns | Wall (s) | TPS   | p50 (ms) | p99 (ms) | Intra Mean (ms) | Intra p99 (ms) | Cross p50 (ms) | Cross p99 (ms) |
+|-----|------|----------|-------|----------|----------|-----------------|----------------|----------------|----------------|
+| 1   | 102  | 2.86     | 35.65 | 98.08    | 483.63   | 78.23           | 483.63         | 146.91         | 525.61         |
+| 2   | 134  | 4.06     | 32.97 | 98.44    | 600.32   | 84.17           | 601.89         | 127.08         | 600.32         |
+| 3   | 124  | 3.18     | 38.96 | 160.61   | 946.43   | 108.40          | 971.28         | 247.01         | 946.43         |
+| 4   | 138  | 3.53     | 39.10 | 158.23   | 901.99   | 143.62          | 998.12         | 160.74         | 597.20         |
+| 5   | 128  | 3.11     | 41.14 | 215.45   | 1250.12  | 132.77          | 1257.04        | 294.16         | 1250.12        |
 
 **Summary (averages across 5 runs):**
 - Throughput: ~37.6 TPS
@@ -284,14 +284,14 @@ cd 2pc
 mkdir build && cd build
 
 cmake -DCMAKE_PREFIX_PATH="/opt/homebrew/opt/grpc;/opt/homebrew/opt/protobuf@33;/opt/homebrew/opt/abseil" ..
-cmake --build . -j$(nproc)
+cmake --build . -j$(sysctl -n hw.logicalcpu)
 ```
 
 On Linux with a local gRPC install at `$MY_INSTALL_DIR`:
 
 ```bash
 cmake -DCMAKE_PREFIX_PATH=$MY_INSTALL_DIR ..
-cmake --build . -j$(nproc)
+cmake --build . -j$(sysctl -n hw.logicalcpu)
 ```
 
 ### Run
