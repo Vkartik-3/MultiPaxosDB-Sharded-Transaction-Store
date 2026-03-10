@@ -1,0 +1,8 @@
+.vscode
+.github
+*.DS_STORE
+/grpc
+/build
+*.db
+src/thirdparty
+claude
