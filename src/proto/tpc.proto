@@ -60,7 +60,10 @@ message Ballot {
 
 message PrepareReq {
     Ballot ballot = 1;
-    int32 last_inserted = 2;
+    // Count of Paxos-agreed entries (NOT the raw log index). Used only for the
+    // prepare consistency check; excludes async 2PC-decision/abort appends so it
+    // stays identical across replicas for the same agreed sequence.
+    int32 paxos_index = 2;
 }
 
 message PrepareRes {
@@ -70,7 +73,8 @@ message PrepareRes {
     optional Ballot accept_num = 3;
     repeated TransferReq accept_val = 4;
     optional int32 latest_ballot_num = 5;
-    optional int32 last_inserted = 6;
+    // Replica's Paxos-agreed entry count (see PrepareReq.paxos_index).
+    optional int32 paxos_index = 6;
     optional int32 server_id = 7;
 }
 

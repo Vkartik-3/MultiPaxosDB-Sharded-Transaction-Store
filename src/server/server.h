@@ -139,6 +139,13 @@ private:
 
     int last_inserted;
     Ballot last_inserted_ballot;
+    // Count (as an index, -1 == empty) of entries this server agreed via Paxos
+    // only: bumped once per prepare/commit append, never by async 2PC-decision or
+    // lock-timeout-abort appends. last_inserted (raw log index) drifts between
+    // replicas because those async appends interleave differently per server;
+    // paxos_index does not, so it is the correct key for the prepare/sync trigger.
+    // (The sync payload still ranges over the raw log via last_inserted.)
+    int paxos_index;
 
     bool in_sync;
 

@@ -36,6 +36,16 @@ ServerImpl::ServerImpl(int id, std::string name): wal("wal_" + std::to_string(id
     await_prepare_decision = false;
     await_accept_decision = false;
     last_inserted = -1;
+    paxos_index = -1;
+}
+
+// A log entry counts toward paxos_index iff it was produced by a Paxos-agreed
+// append: an intra-shard commit (INTRA/COMMITTED) or a cross-shard 2PC prepare
+// (CROSS/PREPARED). 2PC decision/abort entries (CROSS/COMMITTED, *_ABORTED) do
+// not count — they are appended asynchronously and independently per replica.
+static bool isPaxosEntry(const types::WALEntry& e) {
+    return (e.type == types::TransactionType::INTRA && e.status == types::TransactionStatus::COMMITTED)
+        || (e.type == types::TransactionType::CROSS && e.status == types::TransactionStatus::PREPARED);
 }
 
 ServerImpl::~ServerImpl() {
@@ -105,6 +115,8 @@ void ServerImpl::run(std::string address) {
         last_inserted_ballot.set_num(log[last_inserted].ballot_num);
         last_inserted_ballot.set_server_id(log[last_inserted].ballot_server_id);
     }
+    paxos_index = -1;
+    for (auto& e: log) if (isPaxosEntry(e)) paxos_index++;
     persistBallotNum();
 
     logger->info("Server running on {}. Stubs size {}", address, stubs.size());
@@ -210,6 +222,7 @@ void ServerImpl::prepareTransaction(TransferReq& request, Ballot& ballot) {
 
     last_inserted = log.size() - 1;
     last_inserted_ballot = ballot;
+    paxos_index++;
     prepareTimestamps[request.tid()] = std::chrono::steady_clock::now();
 }
 
@@ -223,7 +236,8 @@ void ServerImpl::commitTransaction(TransferReq& request, Ballot& ballot) {
     updateBalance(entry.txn.receiver, balances[entry.txn.receiver]);
 
     last_inserted = log.size() - 1;
-    last_inserted_ballot = ballot;    
+    last_inserted_ballot = ballot;
+    paxos_index++;
 }
 
 void ServerImpl::enqueueClientTxn(InCall* call, const TransferReq& req, bool is_cross_shard) {
@@ -266,7 +280,7 @@ void ServerImpl::reissuePrepareForCurrent() {
 
     PrepareReq prepare;
     prepare.mutable_ballot()->CopyFrom(ballot);
-    prepare.set_last_inserted(last_inserted);
+    prepare.set_paxos_index(paxos_index);
 
     logger->debug("Sending prepare for batch of {} to replicas", current_.size());
     for (auto& pair: stubs) {
@@ -389,15 +403,16 @@ void ServerImpl::processPrepareCall(PrepareReq& request, PrepareRes& response) {
     bool ack = false;
     logger->debug("Received prepare {}", request.DebugString());
     if (request.ballot().num() > ballot_num) {
-        if (request.last_inserted() == last_inserted) {
+        if (request.paxos_index() == paxos_index) {
             ack = true;
             promised = true;
             promised_num = request.ballot();
             ballot_num = request.ballot().num();
             persistBallotNum();
 
-        } else if (request.last_inserted() > last_inserted) {
-            // Synchronize
+        } else if (request.paxos_index() > paxos_index) {
+            // Behind on the agreed log: catch up. The sync range still uses the
+            // raw log index (last_inserted), not paxos_index.
             in_sync = true;
             SyncReq sync;
             sync.set_last_inserted(last_inserted);
@@ -415,7 +430,7 @@ void ServerImpl::processPrepareCall(PrepareReq& request, PrepareRes& response) {
     } else if (!ack) {
         response.set_server_id(server_id);
         if (request.ballot().num() <= ballot_num) response.set_latest_ballot_num(ballot_num);
-        if (request.last_inserted() < last_inserted) response.set_last_inserted(last_inserted);
+        if (request.paxos_index() < paxos_index) response.set_paxos_index(paxos_index);
     }
     logger->debug("Prepare response {}", response.DebugString());
 }
@@ -580,7 +595,7 @@ void ServerImpl::handlePrepareReply(Status& status, PrepareReq& request, Prepare
         }
 
         // Leader's log is outdated: sync first, then retry the batch.
-        if (response.has_last_inserted() && response.last_inserted() > last_inserted) {
+        if (response.has_paxos_index() && response.paxos_index() > paxos_index) {
             in_sync = true;
             await_prepare_decision = false;
 
@@ -631,6 +646,7 @@ void ServerImpl::handleSyncReply(Status& status, SyncRes& response) {
                 };
                 log.push_back(entry);
                 wal.insertEntry(entry);
+                if (isPaxosEntry(entry)) paxos_index++;
 
                 // Only move balances for entries this server hasn't already applied.
                 bool first_apply = entry.status == types::TransactionStatus::COMMITTED
