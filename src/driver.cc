@@ -84,21 +84,32 @@ int main(int argc, char **argv) {
     int num_clusters = std::stoi(argv[1]);
     int cluster_size = std::stoi(argv[2]);
     std::string filename = argv[3];
-    std::thread t;
+
     try {
         utils::setupApplicationState(num_clusters, cluster_size);
         if (argc == 5) utils::loadConfig(argv[4]);
         utils::startAllServers(num_clusters, cluster_size);
-        
-        Client client;
+    } catch (const std::exception& e) {
+        std::cerr << "Exception during startup: " << e.what() << std::endl;
+        exit(1);
+    }
+
+    Client client;
+    client.waitForServersReady(5000);  // don't accept commands until servers are up
+
+    std::thread t(&Client::consumeReplies, &client);
+    try {
         CSVReader reader(filename);
-        std::thread t(&Client::consumeReplies, &client);
         mainloop(reader, client);
     } catch (const std::exception& e) {
         std::cerr << "Exception: " << e.what() << std::endl;
-        t.join();
-        exit(1);
-    } 
-    
+    }
+
+    // Clean shutdown: stop the reply queue so the consumer thread exits, then
+    // join it before client (and its cq) are destroyed. Prevents the
+    // std::thread-destroyed-while-joinable crash at exit.
+    client.shutdown();
+    if (t.joinable()) t.join();
+
     return 0;
 }

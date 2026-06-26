@@ -72,17 +72,22 @@ void utils::startAllServers(int num_clusters, int cluster_size) {
 }
 
 void utils::killAllServers() {
-    for (auto& p: utils::server_pids) {
-        pid_t pid = utils::server_pids[p.first];
-        if (kill(p.second, SIGTERM) == -1) {
-            throw std::runtime_error("Failed to kill server: " + p.first);
-        } else {
-            utils::server_pids.erase(p.first);
+    // Iterate with an explicit iterator and erase via the value returned by
+    // erase(); erasing by key inside a range-for invalidates the loop iterator
+    // and leads to undefined behaviour (observed as a SIGSEGV at shutdown).
+    for (auto it = utils::server_pids.begin(); it != utils::server_pids.end();) {
+        const std::string& name = it->first;
+        pid_t pid = it->second;
+
+        if (kill(pid, SIGTERM) == -1) {
+            throw std::runtime_error("Failed to kill server: " + name);
         }
 
         int status;
         if (waitpid(pid, &status, 0) == -1) {
-            throw std::runtime_error("waitpid failed for server: " + p.first);
+            throw std::runtime_error("waitpid failed for server: " + name);
         }
+
+        it = utils::server_pids.erase(it);
     }
 }

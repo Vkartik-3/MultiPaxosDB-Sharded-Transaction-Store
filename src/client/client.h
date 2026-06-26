@@ -30,6 +30,15 @@ public:
     void printPerformance();
     void consumeReplies();
 
+    // Block until every server's channel is connectable (or timeout). Avoids
+    // the startup race where transactions are submitted before the freshly
+    // forked servers have bound their ports.
+    void waitForServersReady(int timeout_ms);
+
+    // Shut down the reply completion queue so consumeReplies() drains and
+    // returns, allowing its thread to be joined cleanly at exit.
+    void shutdown();
+
 private:
     void sendTransfer(TransferReq& request, std::string leader);
     void tpcPrepare(TransferReq& request, std::string leader);
@@ -37,6 +46,7 @@ private:
     void tpcAbort(TpcTid& request, int sender_cluster, int receiver_cluster);
 
 
+    std::map<std::string, std::shared_ptr<grpc::Channel>> channels;
     std::map<std::string, std::unique_ptr<TpcServer::Stub>> stubs;
     const static int RPC_TIMEOUT_MS = 10;
     CompletionQueue cq;

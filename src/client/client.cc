@@ -20,11 +20,26 @@ Client::Client() {
     logger = spdlog::get("console");
     for (auto& s: constants::server_ids) {
         std::string name = s.first;
-        stubs[name] = TpcServer::NewStub(grpc::CreateChannel(constants::server_addresses[name], grpc::InsecureChannelCredentials()));    
+        channels[name] = grpc::CreateChannel(constants::server_addresses[name], grpc::InsecureChannelCredentials());
+        stubs[name] = TpcServer::NewStub(channels[name]);
     }
 
     transactions_processed = 0;
     wall_started = false;
+}
+
+void Client::waitForServersReady(int timeout_ms) {
+    auto deadline = std::chrono::system_clock::now() + std::chrono::milliseconds(timeout_ms);
+    for (auto& c: channels) {
+        c.second->GetState(true);  // trigger connection attempt
+        if (!c.second->WaitForConnected(deadline)) {
+            logger->warn("Server {} not connectable within {}ms; continuing anyway", c.first, timeout_ms);
+        }
+    }
+}
+
+void Client::shutdown() {
+    cq.Shutdown();
 }
 
 void Client::updateDisconnected(std::vector<std::string> disconnected_servers) {
@@ -263,7 +278,11 @@ void Client::consumeReplies() {
 
     while(cq.Next(&tag, &ok)) {
         ClientCall* call = static_cast<ClientCall*>(tag);
-        CHECK(ok);
+        // During cq shutdown, drained events arrive with ok=false; discard them.
+        if (!ok) {
+            delete call;
+            continue;
+        }
         
         if (call->type == types::TRANSFER && call->status.ok()) {
             wall_end = std::chrono::steady_clock::now();

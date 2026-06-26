@@ -119,8 +119,8 @@
 #  define FMT_USE_CONSTEVAL 0
 #elif FMT_LIBCPP_VERSION && FMT_LIBCPP_VERSION < 10000
 #  define FMT_USE_CONSTEVAL 0
-#elif defined(__apple_build_version__) && __apple_build_version__ < 14000029L
-#  define FMT_USE_CONSTEVAL 0  // consteval is broken in Apple clang < 14.
+#elif defined(__apple_build_version__) && (__apple_build_version__ < 14000029L || __apple_build_version__ >= 21000000L)
+#  define FMT_USE_CONSTEVAL 0  // consteval is broken in Apple clang < 14 or >= 21.
 #elif FMT_MSC_VERSION && FMT_MSC_VERSION < 1929
 #  define FMT_USE_CONSTEVAL 0  // consteval is broken in MSVC VS2019 < 16.10.
 #elif defined(__cpp_consteval)
