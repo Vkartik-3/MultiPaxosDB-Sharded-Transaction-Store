@@ -34,6 +34,10 @@ public:
     InCall(TpcServer::AsyncService* service, ServerImpl* server, ServerCompletionQueue* cq, types::RequestTypes type, int retry_timeout_ms);
     void Proceed();
     void Retry();
+    // Called by the server when this call's batch reaches a decision. Sends the
+    // per-client response (ack) and transitions to FINISH. Used for both
+    // Transfer (intra-shard) and TpcPrepare (cross-shard 2PC prepare) calls.
+    void completeTransfer(bool ack, long tid);
 
 private:
     TpcServer::AsyncService* service_;
@@ -69,7 +73,7 @@ private:
     ServerAsyncResponseWriter<AcceptRes> acceptResponder;
     ServerAsyncResponseWriter<SyncRes> syncResponder;
 
-    enum CallStatus { CREATE, PROCESS, RETRY, FINISH };
+    enum CallStatus { CREATE, PROCESS, RETRY, FINISH, AWAIT_BATCH };
     CallStatus status_;  // The current serving state.
     types::RequestTypes type_;
     int retry_timeout_ms_;

@@ -9,6 +9,7 @@ class InCall;  // forward declaration — avoids circular include with in_call.h
 #include <string.h>
 #include <set>
 #include <map>
+#include <vector>
 #include <chrono>
 
 #include "../types/types.h"
@@ -51,15 +52,12 @@ public:
     void handleAcceptReply(Status&, AcceptReq&, AcceptRes&);
     void handleSyncReply(Status&, SyncRes&);
 
-    // Store the InCall that owns the current Paxos round so responses can
-    // wake it up immediately instead of waiting for the 10ms retry alarm.
-    void setPaxosOwnerCall(InCall* call) { paxos_owner_call_ = call; }
-    bool isPaxosOwner(long tid) const { return is_paxos_running && paxos_tid == tid; }
-    
-    bool processTpcPrepare(TransferReq&, TransferRes&);
+    // Client Transfer / TpcPrepare calls are coalesced into batches: each parks
+    // its InCall here and is replied to individually once its batch commits.
+    void enqueueClientTxn(InCall* call, const TransferReq& req, bool is_cross_shard);
+
     void processTpcDecision(TpcTid&, bool);
 
-    bool processTransferCall(TransferReq&, TransferRes&);
     void processPrepareCall(PrepareReq&, PrepareRes&);
     void processAcceptCall(AcceptReq&, AcceptRes&);
     void processCommitCall(CommitReq&);
@@ -70,12 +68,16 @@ public:
     static bool shutdown;
     
 private:
-    bool runPaxos(TransferReq&, TransferRes&, bool write_to_wal);
-    // Called by handlePrepareReply / handleAcceptReply / handleSyncReply when a
-    // phase completes. Directly calls Proceed() on the waiting InCall so the
-    // next Paxos phase starts immediately (RTT ~0.5ms) instead of waiting for
-    // the retry alarm (was 10ms). Safe because the server is single-threaded.
-    void wakeUpPaxosOwner();
+    // Batched Multi-Paxos round driven by the reply handlers. One round commits
+    // every command accumulated in pending_ since the previous round, amortizing
+    // the prepare/accept/commit RPCs and the ballot persist across the batch.
+    void maybeStartRound();
+    void startRound();
+    void reissuePrepareForCurrent();
+    void onPrepareQuorum();
+    void onAcceptQuorum();
+    void onRoundAbort(bool prepare_phase);
+    void finishRound();
     void prepareTransaction(TransferReq& request, Ballot& ballot);
     void commitTransaction(TransferReq& request, Ballot& ballot);
     void getLogEntryFromLocalLog(types::WALEntry& log, LogEntry* entry);
@@ -107,14 +109,25 @@ private:
     const static int RPC_TIMEOUT_MS = 10;
 
     std::map<int, int> balances;
+    // tids whose balance effect has already been applied on THIS server. Makes
+    // balance application idempotent so a catch-up sync (or any duplicate commit
+    // path) can never double-count money. Keyed by transaction id.
+    std::set<long> balance_applied;
     std::set<int> locks;
     std::map<long, std::chrono::steady_clock::time_point> prepareTimestamps;
     static constexpr int TPC_LOCK_TIMEOUT_MS = 5000;
     leveldb::DB* db;
     WAL wal;
     std::vector<types::WALEntry> log;
+
+    struct BatchEntry {
+        TransferReq request;
+        InCall* call;
+        bool is_cross_shard;
+    };
+    std::vector<BatchEntry> pending_;   // accumulating for the next round
+    std::vector<BatchEntry> current_;   // entries accepted into the in-flight round
     bool is_paxos_running;
-    long paxos_tid;
 
     int ballot_num;
     bool promised;
@@ -122,13 +135,12 @@ private:
 
     bool accepted;
     Ballot accept_num;
-    TransferReq accept_val;
+    std::vector<TransferReq> accept_batch;  // values accepted in the current round (leader: from current_; replica: from AcceptReq)
 
     int last_inserted;
     Ballot last_inserted_ballot;
 
     bool in_sync;
-    InCall* paxos_owner_call_ = nullptr;
 
     int prepare_successes;
     int prepare_failures;

@@ -60,23 +60,12 @@ void InCall::Proceed() {
         if (status_ == PROCESS) new InCall(service_, server_, cq_, type_, retry_timeout_ms_);
         switch (type_) {
             case types::RequestTypes::TPC_PREPARE:
-                if (!server_->processTpcPrepare(transferReq, transferRes)) {
-                    status_ = RETRY;
-                    // If we own the current Paxos round, park here: the reply
-                    // handlers (handlePrepareReply / handleAcceptReply) will
-                    // call Proceed() directly when majority is reached, saving
-                    // the full 10ms alarm wait per phase.
-                    // If another round is in progress we're just waiting our
-                    // turn — use the short alarm so we don't spin.
-                    if (server_->isPaxosOwner(transferReq.tid())) {
-                        server_->setPaxosOwnerCall(this);
-                    } else {
-                        Retry();
-                    }
-                    break;
-                }
-                transferResponder.Finish(transferRes, Status::OK, this);
-                status_ = FINISH;
+                // Park and hand off to the batch; the server replies via
+                // completeTransfer() once this entry's round is decided. Set the
+                // parked state before enqueueing so a synchronous completion
+                // (e.g. server disconnected) leaves us in FINISH, not AWAIT_BATCH.
+                status_ = AWAIT_BATCH;
+                server_->enqueueClientTxn(this, transferReq, true);
                 break;
             case types::RequestTypes::TPC_COMMIT:
                 server_->processTpcDecision(tpcTid, true);
@@ -89,17 +78,8 @@ void InCall::Proceed() {
                 status_ = FINISH;
                 break;
             case types::RequestTypes::TRANSFER:
-                if (!server_->processTransferCall(transferReq, transferRes)) {
-                    status_ = RETRY;
-                    if (server_->isPaxosOwner(transferReq.tid())) {
-                        server_->setPaxosOwnerCall(this);
-                    } else {
-                        Retry();
-                    }
-                    break;
-                }
-                transferResponder.Finish(transferRes, Status::OK, this);
-                status_ = FINISH;
+                status_ = AWAIT_BATCH;
+                server_->enqueueClientTxn(this, transferReq, false);
                 break;
             case types::RequestTypes::PREPARE:
                 server_->processPrepareCall(prepareReq, prepareRes);
@@ -138,13 +118,21 @@ void InCall::Proceed() {
                 break;
         }
 
-    } else {
-        CHECK_EQ(status_, FINISH);
+    } else if (status_ == FINISH) {
         delete this;
     }
+    // AWAIT_BATCH: parked, owned by the server's batch; no cq op is pending so
+    // Proceed() is not expected to be invoked in this state.
 }
 
 void InCall::Retry() {
     alarm_ = std::make_unique<grpc::Alarm>();
     alarm_->Set(cq_, gpr_time_from_millis(retry_timeout_ms_, GPR_TIMESPAN), this);
+}
+
+void InCall::completeTransfer(bool ack, long tid) {
+    transferRes.set_ack(ack);
+    transferRes.set_tid(tid);
+    transferResponder.Finish(transferRes, Status::OK, this);
+    status_ = FINISH;
 }

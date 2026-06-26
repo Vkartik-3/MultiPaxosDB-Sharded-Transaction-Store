@@ -76,9 +76,12 @@ void Client::processTransactions(std::vector<types::Transaction> transactions, s
         txn->set_receiver(t.receiver);
         txn->set_amount(t.amount);
 
-        if (!wall_started) {
-            wall_start = std::chrono::steady_clock::now();
-            wall_started = true;
+        {
+            std::lock_guard<std::mutex> lk(state_mtx);
+            if (!wall_started) {
+                wall_start = std::chrono::steady_clock::now();
+                wall_started = true;
+            }
         }
 
         if (!cross_shard) {
@@ -87,7 +90,10 @@ void Client::processTransactions(std::vector<types::Transaction> transactions, s
         } else {
             long now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::steady_clock::now().time_since_epoch()).count();
-            processing[tid] = { { t.sender, t.receiver, t.amount }, 0, 0, now_ns, true };
+            {
+                std::lock_guard<std::mutex> lk(state_mtx);
+                processing[tid] = { { t.sender, t.receiver, t.amount }, 0, 0, now_ns, true };
+            }
             logger->debug("Sending 2PC prepare to {} and {}", sender_leader, receiver_leader);
             tpcPrepare(request, sender_leader);
             tpcPrepare(request, receiver_leader);
@@ -200,6 +206,7 @@ void Client::printPerformance() {
         std::cout << "Latency p99:                   " << p99_ms << " ms" << std::endl;
     };
 
+    std::lock_guard<std::mutex> lk(state_mtx);
     std::cout << std::fixed << std::setprecision(2);
     std::cout << "=== Overall ===" << std::endl;
     std::cout << "Transactions Processed: " << transactions_processed << std::endl;
@@ -285,11 +292,12 @@ void Client::consumeReplies() {
         }
         
         if (call->type == types::TRANSFER && call->status.ok()) {
-            wall_end = std::chrono::steady_clock::now();
             long start_ns = call->reply.tid();  // tid is system_clock epoch-ns start time
             long now_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count();
             long latency_ns = now_ns - start_ns;
+            std::lock_guard<std::mutex> lk(state_mtx);
+            wall_end = std::chrono::steady_clock::now();
             latencies.push_back(latency_ns);
             if (call->is_cross_shard) cross_latencies.push_back(latency_ns);
             else intra_latencies.push_back(latency_ns);
@@ -302,6 +310,8 @@ void Client::consumeReplies() {
                 delete call;
                 continue;
             }
+
+            std::lock_guard<std::mutex> lk(state_mtx);
             if (!call->status.ok() || !call->reply.ack()) ++processing[tid].failures;
             else ++processing[tid].successes;
 

@@ -68,7 +68,7 @@ message PrepareRes {
     Ballot ballot = 2;
 
     optional Ballot accept_num = 3;
-    optional TransferReq accept_val = 4;
+    repeated TransferReq accept_val = 4;
     optional int32 latest_ballot_num = 5;
     optional int32 last_inserted = 6;
     optional int32 server_id = 7;
@@ -76,7 +76,7 @@ message PrepareRes {
 
 message AcceptReq {
     Ballot ballot = 1;
-    TransferReq r = 2;
+    repeated TransferReq batch = 2;
 }
 
 message AcceptRes {

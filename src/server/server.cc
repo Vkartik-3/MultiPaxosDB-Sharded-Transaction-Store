@@ -29,7 +29,6 @@ ServerImpl::ServerImpl(int id, std::string name): wal("wal_" + std::to_string(id
     balances = std::map<int, int>();
     
     is_paxos_running = false;
-    paxos_tid = -1;
     ballot_num = 0;
     promised = false;
     accepted = false;
@@ -176,15 +175,9 @@ bool ServerImpl::isClientInCluster(int client_id) {
     return utils::getClusterIdFromClientId(client_id) == cluster_id;
 }
 
-bool ServerImpl::processTpcPrepare(TransferReq& request, TransferRes& response) {
-    logger->debug("2PC Prepare received {}. Current tid {}", request.DebugString(), paxos_tid);
-    return runPaxos(request, response, true);
-}
-
 void ServerImpl::processTpcDecision(TpcTid& request, bool is_commit) {
     if (i_am_disconnected) return;
     
-    logger->debug("TPC decision received {}. is_commit {}", request.DebugString(), is_commit);
     prepareTimestamps.erase(request.tid());
     auto entry = is_commit ? wal.commitTransaction(request) : wal.abortTransaction(request);
     if (entry.tid != -1) {
@@ -192,26 +185,23 @@ void ServerImpl::processTpcDecision(TpcTid& request, bool is_commit) {
     } else {
         return;
     }
-    
+
+    // Locks are released regardless; balances apply at most once per tid per server.
+    bool first_apply = is_commit && balance_applied.insert(entry.tid).second;
     if (isClientInCluster(entry.txn.sender)) {
         locks.erase(entry.txn.sender);
-        if (is_commit) {
+        if (first_apply) {
             balances[entry.txn.sender] -= entry.txn.amount;
             updateBalance(entry.txn.sender, balances[entry.txn.sender]);
         }
     }
     if (isClientInCluster(entry.txn.receiver)) {
         locks.erase(entry.txn.receiver);
-        if (is_commit) {
+        if (first_apply) {
             balances[entry.txn.receiver] += entry.txn.amount;
             updateBalance(entry.txn.receiver, balances[entry.txn.receiver]);
         }
     }
-}
-
-bool ServerImpl::processTransferCall(TransferReq& request, TransferRes& response) {
-    logger->debug("Transfer received {}. Current tid {}", request.DebugString(), paxos_tid);    
-    return runPaxos(request, response, false);
 }
 
 void ServerImpl::prepareTransaction(TransferReq& request, Ballot& ballot) {
@@ -224,6 +214,7 @@ void ServerImpl::prepareTransaction(TransferReq& request, Ballot& ballot) {
 }
 
 void ServerImpl::commitTransaction(TransferReq& request, Ballot& ballot) {
+    if (!balance_applied.insert(request.tid()).second) return;  // already applied on this server
     auto entry = wal.commitTransaction(request, ballot);
     log.push_back(entry);
     balances[entry.txn.sender] -= entry.txn.amount;
@@ -235,152 +226,156 @@ void ServerImpl::commitTransaction(TransferReq& request, Ballot& ballot) {
     last_inserted_ballot = ballot;    
 }
 
-bool ServerImpl::runPaxos(TransferReq& request, TransferRes& response, bool is_cross_shard) {
-    if (in_sync) {
-        logger->debug("Syncing...");
-        return false;
+void ServerImpl::enqueueClientTxn(InCall* call, const TransferReq& req, bool is_cross_shard) {
+    if (i_am_disconnected) {
+        call->completeTransfer(false, req.tid());
+        return;
+    }
+    pending_.push_back({req, call, is_cross_shard});
+    maybeStartRound();
+}
+
+// Promote the accumulated pending_ batch into a single in-flight round, unless a
+// round is already running or we're mid-sync.
+void ServerImpl::maybeStartRound() {
+    if (is_paxos_running || in_sync || pending_.empty()) return;
+    startRound();
+}
+
+void ServerImpl::startRound() {
+    current_.swap(pending_);
+    pending_.clear();
+    is_paxos_running = true;
+    reissuePrepareForCurrent();
+}
+
+// (Re)run the prepare phase for current_ with a fresh ballot. Used both to start
+// a round and to retry after a sync or a stale-ballot rejection.
+void ServerImpl::reissuePrepareForCurrent() {
+    Ballot ballot;
+    ballot.set_num(++ballot_num);
+    ballot.set_server_id(server_id);
+    persistBallotNum();
+
+    promised = true;
+    promised_num = ballot;
+    await_prepare_decision = true;
+    await_accept_decision = false;
+    prepare_successes = 1;
+    prepare_failures = 0;
+
+    PrepareReq prepare;
+    prepare.mutable_ballot()->CopyFrom(ballot);
+    prepare.set_last_inserted(last_inserted);
+
+    logger->debug("Sending prepare for batch of {} to replicas", current_.size());
+    for (auto& pair: stubs) {
+        OutCall* call = new OutCall(this, response_cq.get(), types::PREPARE, ServerImpl::RPC_TIMEOUT_MS);
+        call->sendPrepare(prepare, pair.second);
+    }
+}
+
+// Prepare quorum reached: validate each entry independently. Entries that fail
+// their preconditions (locked account or insufficient balance, including a
+// conflict with an earlier entry in the same batch) are aborted immediately; the
+// survivors are locked and proposed together in one Accept.
+void ServerImpl::onPrepareQuorum() {
+    await_prepare_decision = false;
+
+    std::vector<BatchEntry> kept;
+    for (auto& e: current_) {
+        int sender = e.request.txn().sender();
+        int receiver = e.request.txn().receiver();
+        int amount = e.request.txn().amount();
+        bool sender_in_cluster = isClientInCluster(sender);
+        bool receiver_in_cluster = isClientInCluster(receiver);
+
+        if ((sender_in_cluster && locks.count(sender))
+                || (receiver_in_cluster && locks.count(receiver))
+                || (sender_in_cluster && balances[sender] < amount)) {
+            e.call->completeTransfer(false, e.request.tid());
+            continue;
+        }
+
+        if (sender_in_cluster) locks.insert(sender);
+        if (receiver_in_cluster) locks.insert(receiver);
+        if (e.is_cross_shard) prepareTransaction(e.request, promised_num);
+        kept.push_back(e);
+    }
+    current_.swap(kept);
+
+    if (current_.empty()) {
+        finishRound();
+        return;
     }
 
-    int sender = request.txn().sender();
-    int receiver = request.txn().receiver();
-    int amount = request.txn().amount();
-    long tid = request.tid();
+    accepted = true;
+    accept_num = promised_num;
+    accept_batch.clear();
+    for (auto& e: current_) accept_batch.push_back(e.request);
 
-    if (is_paxos_running && paxos_tid != tid) return false;
-    response.set_tid(tid);
+    await_accept_decision = true;
+    accept_successes = 1;
+    accept_failures = 0;
 
-    if (!await_prepare_decision && !await_accept_decision) {
-        is_paxos_running = true;
-        paxos_tid = tid;
+    AcceptReq accept;
+    accept.mutable_ballot()->CopyFrom(promised_num);
+    for (auto& e: current_) accept.add_batch()->CopyFrom(e.request);
 
-        Ballot ballot;
-        ballot.set_num(++ballot_num);
-        persistBallotNum();
-        ballot.set_server_id(server_id);
+    logger->debug("Sending accept for batch of {} to replicas", current_.size());
+    for (auto& pair: stubs) {
+        OutCall* call = new OutCall(this, response_cq.get(), types::ACCEPT, ServerImpl::RPC_TIMEOUT_MS);
+        call->sendAccept(accept, pair.second);
+    }
+}
 
-        PrepareReq prepare;
-        prepare.mutable_ballot()->CopyFrom(ballot);
-        prepare.set_last_inserted(last_inserted);
+// Accept quorum reached: commit the batch. Intra-shard entries apply and release
+// their locks; cross-shard (2PC prepare) entries reply PREPARED and keep their
+// locks until the 2PC decision arrives.
+void ServerImpl::onAcceptQuorum() {
+    await_accept_decision = false;
 
-        // Send prepare request to all
-        promised = true;
-        promised_num = ballot;
-        await_prepare_decision = true;
-        prepare_successes = 1;
-        prepare_failures = 0;
-        logger->debug("Sending prepare to replicas {}", prepare.DebugString());
-        for (auto& pair: stubs) {
-            OutCall* call = new OutCall(this, response_cq.get(), types::PREPARE, ServerImpl::RPC_TIMEOUT_MS);
-            call->sendPrepare(prepare, pair.second);
-        }
-        return false;       // await prepare decision
-
-    } else if (await_prepare_decision) {
-        if (prepare_successes >= ServerImpl::MAJORITY) {
-            await_prepare_decision = false;
-
-            // Check transaction conditions. Abort if not satisfied.
-            bool sender_in_cluster = isClientInCluster(sender);
-            bool receiver_in_cluster = isClientInCluster(receiver);
-
-            if ((sender_in_cluster && locks.find(sender) != locks.end())
-                    || (receiver_in_cluster && locks.find(receiver) != locks.end())
-                    || (sender_in_cluster && balances[sender] < amount)) {
-
-                is_paxos_running = false;
-                paxos_tid = -1;
-                logger->debug("Transaction conditions not met");
-                response.set_ack(false);
-                return true;
-            }
-            
-            if (sender_in_cluster) locks.insert(sender);
-            if (receiver_in_cluster) locks.insert(receiver);
-
-            logger->debug("Locking {} and/or {}", sender, receiver);
-            locks.insert(receiver);
-
-            AcceptReq accept;
-            accept.mutable_ballot()->CopyFrom(promised_num);
-            accept.mutable_r()->CopyFrom(request);
-
-            // Send accept request to all
-            accepted = true;
-            accept_num = promised_num;
-            accept_val = request;
-            await_accept_decision = true;
-            accept_successes = 1;
-            accept_failures = 0;
-
-            if (is_cross_shard) prepareTransaction(request, accept_num);
-
-            logger->debug("Sending accept to replicas {}", accept.DebugString());
-            for (auto& pair: stubs) {
-                OutCall* call = new OutCall(this, response_cq.get(), types::ACCEPT, ServerImpl::RPC_TIMEOUT_MS);
-                call->sendAccept(accept, pair.second);
-            }
-            return false;       // await accept decision
-
-        } else if (prepare_failures >= ServerImpl::MAJORITY) {
-            await_prepare_decision = false;
-            is_paxos_running = false;
-            paxos_tid = -1;
-            
-            response.set_ack(false);
-            return true;        // abort transaction
-        }
-
-        return false;           // await for a prepare decision
-
-    } else if (await_accept_decision) {
-        if (accept_successes >= ServerImpl::MAJORITY) {
-            await_accept_decision = false;
-
-            CommitReq commit;
-            commit.mutable_ballot()->CopyFrom(accept_num);
-
-            logger->debug("Sending commit to replicas {}", commit.DebugString());
-            // Send commit request to all
-            for (auto& pair: stubs) {
-                OutCall* call = new OutCall(this, response_cq.get(), types::COMMIT, ServerImpl::RPC_TIMEOUT_MS);
-                call->sendCommit(commit, pair.second);
-            }
-
-            // Update server state
-            if (!is_cross_shard) {
-                locks.erase(sender);
-                locks.erase(receiver);
-                commitTransaction(request, accept_num);
-            }
-            
-            promised = false;
-            accepted = false;
-            await_prepare_decision = false;
-            await_accept_decision = false;
-            
-            response.set_ack(true);
-            is_paxos_running = false;
-            paxos_tid = -1;
-            return true;
-            
-        } else if (accept_failures >= ServerImpl::MAJORITY) {
-            await_accept_decision = false;
-            is_paxos_running = false;
-            paxos_tid = -1;
-            
-            if (!is_cross_shard) {
-                locks.erase(sender);
-                locks.erase(receiver);
-            }
-            
-            response.set_ack(false);
-            return true;        // abort transaction
-        }
-
-        return false;           // wait for an accept decision
+    CommitReq commit;
+    commit.mutable_ballot()->CopyFrom(accept_num);
+    for (auto& pair: stubs) {
+        OutCall* call = new OutCall(this, response_cq.get(), types::COMMIT, ServerImpl::RPC_TIMEOUT_MS);
+        call->sendCommit(commit, pair.second);
     }
 
-    return true;
+    for (auto& e: current_) {
+        if (!e.is_cross_shard) {
+            locks.erase(e.request.txn().sender());
+            locks.erase(e.request.txn().receiver());
+            commitTransaction(e.request, accept_num);
+        }
+        e.call->completeTransfer(true, e.request.tid());
+    }
+
+    finishRound();
+}
+
+// Quorum could not be reached for the round. Abort every entry still in flight,
+// releasing locks acquired during prepare (accept-phase failures only).
+void ServerImpl::onRoundAbort(bool prepare_phase) {
+    for (auto& e: current_) {
+        if (!prepare_phase && !e.is_cross_shard) {
+            locks.erase(e.request.txn().sender());
+            locks.erase(e.request.txn().receiver());
+        }
+        e.call->completeTransfer(false, e.request.tid());
+    }
+    finishRound();
+}
+
+void ServerImpl::finishRound() {
+    is_paxos_running = false;
+    promised = false;
+    accepted = false;
+    await_prepare_decision = false;
+    await_accept_decision = false;
+    current_.clear();
+    accept_batch.clear();
+    maybeStartRound();   // drain anything that accumulated while this round ran
 }
 
 
@@ -402,7 +397,6 @@ void ServerImpl::processPrepareCall(PrepareReq& request, PrepareRes& response) {
             persistBallotNum();
 
         } else if (request.last_inserted() > last_inserted) {
-            logger->debug("Requesting sync due to prepare");
             // Synchronize
             in_sync = true;
             SyncReq sync;
@@ -417,7 +411,7 @@ void ServerImpl::processPrepareCall(PrepareReq& request, PrepareRes& response) {
     response.mutable_ballot()->CopyFrom(request.ballot());
     if (ack && accepted) {
         response.mutable_accept_num()->CopyFrom(accept_num);
-        response.mutable_accept_val()->CopyFrom(accept_val);
+        for (auto& v: accept_batch) response.add_accept_val()->CopyFrom(v);
     } else if (!ack) {
         response.set_server_id(server_id);
         if (request.ballot().num() <= ballot_num) response.set_latest_ballot_num(ballot_num);
@@ -439,27 +433,29 @@ void ServerImpl::processAcceptCall(AcceptReq& request, AcceptRes& response) {
         ack = true;
         accepted = true;
         accept_num = request.ballot();
-        accept_val = request.r();
 
-        int sender = accept_val.txn().sender();
-        int receiver = accept_val.txn().receiver();
-        int amount = accept_val.txn().amount();
+        accept_batch.clear();
+        for (auto& r: request.batch()) {
+            accept_batch.push_back(r);
+            TransferReq& stored = accept_batch.back();
 
-        int in_cluster = 0;
-        if (isClientInCluster(sender)) {
-            logger->debug("Locking {}", sender);
-            locks.insert(sender);
-            ++in_cluster;
-        }
-        if (isClientInCluster(receiver)) {
-            logger->debug("Locking {}", receiver);
-            locks.insert(receiver);
-            ++in_cluster;
-        }
+            int sender = stored.txn().sender();
+            int receiver = stored.txn().receiver();
 
-        if (in_cluster == 1) {
-            logger->debug("Preparing transaction having tid {}", accept_val.tid());
-            prepareTransaction(accept_val, accept_num);
+            int in_cluster = 0;
+            if (isClientInCluster(sender)) {
+                locks.insert(sender);
+                ++in_cluster;
+            }
+            if (isClientInCluster(receiver)) {
+                locks.insert(receiver);
+                ++in_cluster;
+            }
+
+            // Exactly one side in this cluster => cross-shard 2PC prepare.
+            if (in_cluster == 1) {
+                prepareTransaction(stored, accept_num);
+            }
         }
     }
 
@@ -476,27 +472,25 @@ void ServerImpl::processCommitCall(CommitReq& request) {
     logger->debug("Received commit {}", request.DebugString());
     int commit_ballot_num = request.ballot().num();
     if (promised_num.num() == commit_ballot_num && accept_num.num() == commit_ballot_num) {
-        last_inserted = log.size() - 1;
-        last_inserted_ballot = accept_num;
-        
-        int sender = accept_val.txn().sender();
-        int receiver = accept_val.txn().receiver();
-        int amount = accept_val.txn().amount();
+        for (auto& r: accept_batch) {
+            int sender = r.txn().sender();
+            int receiver = r.txn().receiver();
 
-        int in_cluster = 0;
-        if (isClientInCluster(sender)) {
-            logger->debug("Unlocking {}", sender);
-            locks.erase(sender);
-            ++in_cluster;
-        }
-        if (isClientInCluster(receiver)) {
-            logger->debug("Unlocking {}", receiver);
-            locks.erase(receiver);
-            ++in_cluster;
-        }
+            int in_cluster = 0;
+            if (isClientInCluster(sender)) {
+                locks.erase(sender);
+                ++in_cluster;
+            }
+            if (isClientInCluster(receiver)) {
+                locks.erase(receiver);
+                ++in_cluster;
+            }
 
-        if (in_cluster == 2) {
-            commitTransaction(accept_val, accept_num);
+            // Both sides in this cluster => intra-shard: apply now. Cross-shard
+            // entries wait for the 2PC decision to apply balances.
+            if (in_cluster == 2) {
+                commitTransaction(r, accept_num);
+            }
         }
         promised = false;
         accepted = false;
@@ -569,32 +563,24 @@ void ServerImpl::processDisconnectCall(DisconnectReq& request) {
     }
 }
 
-void ServerImpl::wakeUpPaxosOwner() {
-    if (!paxos_owner_call_) return;
-    InCall* call = paxos_owner_call_;
-    paxos_owner_call_ = nullptr;   // clear before calling Proceed to avoid re-entry confusion
-    call->Proceed();               // single-threaded: safe to call synchronously here
-}
-
 void ServerImpl::handlePrepareReply(Status& status, PrepareReq& request, PrepareRes& response) {
     if (!await_prepare_decision) return;
     if (!status.ok() && status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED && request.ballot().num() == promised_num.num() && request.ballot().server_id() == server_id) {
         ++prepare_failures;
     } else if (status.ok() && response.ballot().num() == promised_num.num() && response.ballot().server_id() == server_id) {
         response.ack() ? ++prepare_successes : ++prepare_failures;
-        logger->debug("response last inserted: {}, my last inserted {}", response.last_inserted(), last_inserted);
 
-        // Leader's ballot number is outdated
+        // Leader's ballot number is outdated: adopt the higher number and retry
+        // the same batch with a fresh ballot.
         if (response.has_latest_ballot_num()) {
-            logger->debug("Updating ballot number");
             ballot_num = response.latest_ballot_num();
             persistBallotNum();
-            await_prepare_decision = false;
+            reissuePrepareForCurrent();
+            return;
         }
 
-        // Leader's log is outdated
+        // Leader's log is outdated: sync first, then retry the batch.
         if (response.has_last_inserted() && response.last_inserted() > last_inserted) {
-            logger->debug("Requesting sync due to prepare reject");
             in_sync = true;
             await_prepare_decision = false;
 
@@ -603,18 +589,14 @@ void ServerImpl::handlePrepareReply(Status& status, PrepareReq& request, Prepare
 
             OutCall* call = new OutCall(this, response_cq.get(), types::SYNC, ServerImpl::RPC_TIMEOUT_MS);
             call->sendSync(sync, stubs[response.server_id()]);
+            return;
         }
     }
 
-    logger->debug("Received prepare response {}", response.DebugString());
-    logger->debug("Successes {}. Failures {}", prepare_successes, prepare_failures);
-
-    // Wake the owner immediately when a decision is reachable. The owner's
-    // runPaxos() will re-check the counters and advance the state machine.
-    // The !await_prepare_decision guard at entry prevents double-wakeup from
-    // subsequent replies because runPaxos() clears that flag on each advance.
-    if (prepare_successes >= MAJORITY || prepare_failures >= MAJORITY || !await_prepare_decision) {
-        wakeUpPaxosOwner();
+    if (prepare_successes >= MAJORITY) {
+        onPrepareQuorum();
+    } else if (prepare_failures >= MAJORITY) {
+        onRoundAbort(true);
     }
 }
 
@@ -626,8 +608,10 @@ void ServerImpl::handleAcceptReply(Status& status, AcceptReq& request, AcceptRes
         response.ack() ? ++accept_successes : ++accept_failures;
     }
 
-    if (accept_successes >= MAJORITY || accept_failures >= MAJORITY) {
-        wakeUpPaxosOwner();
+    if (accept_successes >= MAJORITY) {
+        onAcceptQuorum();
+    } else if (accept_failures >= MAJORITY) {
+        onRoundAbort(false);
     }
 }
 
@@ -647,12 +631,15 @@ void ServerImpl::handleSyncReply(Status& status, SyncRes& response) {
                 };
                 log.push_back(entry);
                 wal.insertEntry(entry);
-                
-                if (entry.status == types::TransactionStatus::COMMITTED && isClientInCluster(entry.txn.sender)) {
+
+                // Only move balances for entries this server hasn't already applied.
+                bool first_apply = entry.status == types::TransactionStatus::COMMITTED
+                                   && balance_applied.insert(entry.tid).second;
+                if (first_apply && isClientInCluster(entry.txn.sender)) {
                     balances[entry.txn.sender] -= entry.txn.amount;
                     updateBalance(entry.txn.sender, balances[entry.txn.sender]);
                 }
-                if (entry.status == types::TransactionStatus::COMMITTED && isClientInCluster(entry.txn.receiver)) {
+                if (first_apply && isClientInCluster(entry.txn.receiver)) {
                     balances[entry.txn.receiver] += entry.txn.amount;
                     updateBalance(entry.txn.receiver, balances[entry.txn.receiver]);
                 }
@@ -666,9 +653,13 @@ void ServerImpl::handleSyncReply(Status& status, SyncRes& response) {
     }
 
     in_sync = false;
-    // If a pending Paxos was waiting for sync to finish before retrying,
-    // wake it up now so it can restart the prepare phase.
-    wakeUpPaxosOwner();
+    // If a round was paused waiting for sync, retry its prepare now; otherwise
+    // start a round for anything that queued up while we were syncing.
+    if (!current_.empty()) {
+        reissuePrepareForCurrent();
+    } else {
+        maybeStartRound();
+    }
 }
 
 void ServerImpl::updateBalance(int client_id, int balance) {

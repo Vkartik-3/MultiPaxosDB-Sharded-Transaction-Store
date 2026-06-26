@@ -25,6 +25,12 @@ void mainloop(CSVReader& reader, Client& client) {
 
     while(!exit) {
         parser.promptUserForCommand(command);
+        // Stdin closed (EOF / piped input exhausted): shut down instead of
+        // spinning forever on failed reads.
+        if (!std::cin) {
+            utils::killAllServers();
+            break;
+        }
         try {
             c = parser.parseCommand(command);
         } catch (const std::invalid_argument& e) {

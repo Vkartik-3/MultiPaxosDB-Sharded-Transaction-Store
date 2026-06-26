@@ -3,6 +3,7 @@
 #include "tpc.grpc.pb.h"
 
 #include <vector>
+#include <mutex>
 #include <spdlog/spdlog.h>
 
 #include "../types/types.h"
@@ -71,6 +72,11 @@ private:
         bool is_cross_shard;
     };
 
+    // Guards state shared between the submitting thread (processTransactions)
+    // and the reply thread (consumeReplies): the in-flight 2PC table and the
+    // latency/throughput accumulators. Without this, concurrent insert/erase on
+    // `processing` corrupts the map (segfaults, duplicate 2PC decisions).
+    std::mutex state_mtx;
     std::map<long, TpcPrepareRes> processing;
     std::vector<long> latencies;  // per-transaction latency in nanoseconds
     std::vector<long> intra_latencies;
