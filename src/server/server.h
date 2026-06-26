@@ -106,7 +106,13 @@ private:
     // yet (another round is in progress). The slot turns over in ~1-3ms on
     // localhost, so 2ms gives fast re-entry without a spin loop.
     const static int RETRY_TIMEOUT_MS = 2;
-    const static int RPC_TIMEOUT_MS = 10;
+    // Peer RPC deadline. At 10ms a peer busy in its own round on the single
+    // threaded event loop would blow the deadline and be counted as a failure,
+    // spuriously aborting otherwise-healthy rounds under load. 200ms is well
+    // above worst-case localhost service latency while still detecting a truly
+    // dead peer quickly (quorum needs only 1 of 2 peers, so a live peer still
+    // finishes the round without waiting on this deadline).
+    const static int RPC_TIMEOUT_MS = 200;
 
     std::map<int, int> balances;
     // tids whose balance effect has already been applied on THIS server. Makes
