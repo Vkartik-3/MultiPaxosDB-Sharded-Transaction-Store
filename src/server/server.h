@@ -1,4 +1,5 @@
 #pragma once
+class InCall;  // forward declaration — avoids circular include with in_call.h
 #include <grpcpp/grpcpp.h>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
@@ -49,6 +50,11 @@ public:
     void handlePrepareReply(Status&, PrepareReq&, PrepareRes&);
     void handleAcceptReply(Status&, AcceptReq&, AcceptRes&);
     void handleSyncReply(Status&, SyncRes&);
+
+    // Store the InCall that owns the current Paxos round so responses can
+    // wake it up immediately instead of waiting for the 10ms retry alarm.
+    void setPaxosOwnerCall(InCall* call) { paxos_owner_call_ = call; }
+    bool isPaxosOwner(long tid) const { return is_paxos_running && paxos_tid == tid; }
     
     bool processTpcPrepare(TransferReq&, TransferRes&);
     void processTpcDecision(TpcTid&, bool);
@@ -65,6 +71,11 @@ public:
     
 private:
     bool runPaxos(TransferReq&, TransferRes&, bool write_to_wal);
+    // Called by handlePrepareReply / handleAcceptReply / handleSyncReply when a
+    // phase completes. Directly calls Proceed() on the waiting InCall so the
+    // next Paxos phase starts immediately (RTT ~0.5ms) instead of waiting for
+    // the retry alarm (was 10ms). Safe because the server is single-threaded.
+    void wakeUpPaxosOwner();
     void prepareTransaction(TransferReq& request, Ballot& ballot);
     void commitTransaction(TransferReq& request, Ballot& ballot);
     void getLogEntryFromLocalLog(types::WALEntry& log, LogEntry* entry);
@@ -89,7 +100,10 @@ private:
 
     const static int CLUSTER_SIZE = 3;
     const static int MAJORITY = 2;
-    const static int RETRY_TIMEOUT_MS = 10;
+    // Reduced from 10ms: used for transactions that can't get the Paxos slot
+    // yet (another round is in progress). The slot turns over in ~1-3ms on
+    // localhost, so 2ms gives fast re-entry without a spin loop.
+    const static int RETRY_TIMEOUT_MS = 2;
     const static int RPC_TIMEOUT_MS = 10;
 
     std::map<int, int> balances;
@@ -114,7 +128,8 @@ private:
     Ballot last_inserted_ballot;
 
     bool in_sync;
-    
+    InCall* paxos_owner_call_ = nullptr;
+
     int prepare_successes;
     int prepare_failures;
     int accept_successes;

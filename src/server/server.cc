@@ -569,15 +569,21 @@ void ServerImpl::processDisconnectCall(DisconnectReq& request) {
     }
 }
 
+void ServerImpl::wakeUpPaxosOwner() {
+    if (!paxos_owner_call_) return;
+    InCall* call = paxos_owner_call_;
+    paxos_owner_call_ = nullptr;   // clear before calling Proceed to avoid re-entry confusion
+    call->Proceed();               // single-threaded: safe to call synchronously here
+}
+
 void ServerImpl::handlePrepareReply(Status& status, PrepareReq& request, PrepareRes& response) {
     if (!await_prepare_decision) return;
     if (!status.ok() && status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED && request.ballot().num() == promised_num.num() && request.ballot().server_id() == server_id) {
-        // logger->debug("Status not OK. Error code {}. Response {}", std::to_string(status.error_code()), response.DebugString());
         ++prepare_failures;
     } else if (status.ok() && response.ballot().num() == promised_num.num() && response.ballot().server_id() == server_id) {
         response.ack() ? ++prepare_successes : ++prepare_failures;
         logger->debug("response last inserted: {}, my last inserted {}", response.last_inserted(), last_inserted);
-        
+
         // Leader's ballot number is outdated
         if (response.has_latest_ballot_num()) {
             logger->debug("Updating ballot number");
@@ -588,11 +594,10 @@ void ServerImpl::handlePrepareReply(Status& status, PrepareReq& request, Prepare
 
         // Leader's log is outdated
         if (response.has_last_inserted() && response.last_inserted() > last_inserted) {
-            // Synchronize
             logger->debug("Requesting sync due to prepare reject");
             in_sync = true;
             await_prepare_decision = false;
-            
+
             SyncReq sync;
             sync.set_last_inserted(last_inserted);
 
@@ -603,15 +608,26 @@ void ServerImpl::handlePrepareReply(Status& status, PrepareReq& request, Prepare
 
     logger->debug("Received prepare response {}", response.DebugString());
     logger->debug("Successes {}. Failures {}", prepare_successes, prepare_failures);
+
+    // Wake the owner immediately when a decision is reachable. The owner's
+    // runPaxos() will re-check the counters and advance the state machine.
+    // The !await_prepare_decision guard at entry prevents double-wakeup from
+    // subsequent replies because runPaxos() clears that flag on each advance.
+    if (prepare_successes >= MAJORITY || prepare_failures >= MAJORITY || !await_prepare_decision) {
+        wakeUpPaxosOwner();
+    }
 }
 
 void ServerImpl::handleAcceptReply(Status& status, AcceptReq& request, AcceptRes& response) {
     if (!await_accept_decision) return;
     if (!status.ok() && status.error_code() == grpc::StatusCode::DEADLINE_EXCEEDED && request.ballot().num() == accept_num.num() && request.ballot().server_id() == server_id) {
         ++accept_failures;
-    }
-    else if (status.ok() && response.ballot().num() == accept_num.num() && response.ballot().server_id() == server_id) {
+    } else if (status.ok() && response.ballot().num() == accept_num.num() && response.ballot().server_id() == server_id) {
         response.ack() ? ++accept_successes : ++accept_failures;
+    }
+
+    if (accept_successes >= MAJORITY || accept_failures >= MAJORITY) {
+        wakeUpPaxosOwner();
     }
 }
 
@@ -650,6 +666,9 @@ void ServerImpl::handleSyncReply(Status& status, SyncRes& response) {
     }
 
     in_sync = false;
+    // If a pending Paxos was waiting for sync to finish before retrying,
+    // wake it up now so it can restart the prepare phase.
+    wakeUpPaxosOwner();
 }
 
 void ServerImpl::updateBalance(int client_id, int balance) {

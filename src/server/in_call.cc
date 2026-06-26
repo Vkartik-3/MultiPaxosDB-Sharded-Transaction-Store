@@ -62,7 +62,17 @@ void InCall::Proceed() {
             case types::RequestTypes::TPC_PREPARE:
                 if (!server_->processTpcPrepare(transferReq, transferRes)) {
                     status_ = RETRY;
-                    Retry();
+                    // If we own the current Paxos round, park here: the reply
+                    // handlers (handlePrepareReply / handleAcceptReply) will
+                    // call Proceed() directly when majority is reached, saving
+                    // the full 10ms alarm wait per phase.
+                    // If another round is in progress we're just waiting our
+                    // turn — use the short alarm so we don't spin.
+                    if (server_->isPaxosOwner(transferReq.tid())) {
+                        server_->setPaxosOwnerCall(this);
+                    } else {
+                        Retry();
+                    }
                     break;
                 }
                 transferResponder.Finish(transferRes, Status::OK, this);
@@ -81,7 +91,11 @@ void InCall::Proceed() {
             case types::RequestTypes::TRANSFER:
                 if (!server_->processTransferCall(transferReq, transferRes)) {
                     status_ = RETRY;
-                    Retry();
+                    if (server_->isPaxosOwner(transferReq.tid())) {
+                        server_->setPaxosOwnerCall(this);
+                    } else {
+                        Retry();
+                    }
                     break;
                 }
                 transferResponder.Finish(transferRes, Status::OK, this);
