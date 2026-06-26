@@ -12,13 +12,19 @@
 - **System:** Sharded bank built on **Multi-Paxos (intra-shard)** + **2PC (cross-shard)**.
   3 clusters × 3 servers (9 servers, named `S1`–`S9`), single-threaded async-gRPC event
   loop per server. C++, gRPC, protobuf, spdlog, LevelDB.
-- **What we just did:** implemented **batching** (many client txns committed per Paxos
-  round) and fixed a serious **money-conservation regression** it introduced.
+- **What we just did:** implemented **batching**, fixed the **money-conservation
+  regression** it introduced, fixed the **spurious-sync storm** (Step A, `paxos_index`),
+  and — crucially — discovered the path to the throughput goal (see below).
 - **Correctness status:** ✅ FIXED. Money is conserved (total balance = `N*10`, verified
-  across runs).
-- **Performance status:** ⚠️ ~190 TPS — currently **below** the ~660 TPS baseline. The
-  batching benefit is being eaten by spurious sync storms and by per-transaction fsync
-  (Phase 0 work never done). See the plan in §6.
+  across runs and at ~10k TPS load).
+- **Performance status:** ✅ **~10k TPS GOAL REACHED.** Run `test/load_benchmark.sh`
+  (concurrent disjoint intra-shard load across all 3 clusters): **~11k TPS (9k–14k),
+  conservation exact.** The old **"~190 TPS" was an artifact of the throttled
+  `correctness_check.sh`**, NOT the system ceiling (which is ~1.3k tps at batch size 1).
+  The real lever was offered concurrent load, not group-commit. See §6.
+- **Two benchmarks — don't mix them:** `correctness_check.sh` (throttled, 50 small sets,
+  conservation) measures ~185–200 tps; `test/load_benchmark.sh` (1500 concurrent disjoint
+  transfers, 3 clusters) measures ~8k–14k. "The system does 10k" means the load benchmark.
 - **CRITICAL GOTCHA that wasted hours:** stale "zombie" server processes from crashed
   runs keep running, hog the ports/CPU, and **poison every benchmark**. ALWAYS check &
   kill them before trusting any number. See §5.1.
@@ -177,53 +183,62 @@ clients_touched=197 expected_total=1970 ... per_replica_total=1970   # GOOD (== 
 
 ---
 
-## 6. Remaining work — detailed plan to reach 10,000 TPS
+## 6. Throughput work — what we found, and the result (~10k TPS reached)
 
-Current ~190 TPS (range 164–222) is **below** the ~660 baseline. Batching alone, as built,
-is a net regression because of sync churn + per-txn fsync. The agreed phased plan, in the
-**correct order** to actually realize the gain:
+> **The original plan in this section was B-before-C and assumed ~190 TPS was the
+> system ceiling. Both were wrong. This section now records what the measurements
+> actually showed and the path that reached the 10k goal.** Lesson (again): measure
+> before optimizing.
 
-### Step A — Fix the spurious sync trigger  (≈30 min, `server.cc`)  ← DO FIRST
-**Problem:** `last_inserted` (raw per-server log index) drifts because async 2PC-decision
-entries (`CS_COMMIT`/`CS_ABORT`) and variable batch sizes make logs non-identical across
-servers. The prepare-phase consistency check (`processPrepareCall` compares
-`request.last_inserted()` vs `last_inserted`; `handlePrepareReply` compares the reply's
-`last_inserted`) then fires catch-up syncs constantly.
-**Fix options (pick one):**
-- Track a separate **Paxos-accepted index** (count of entries agreed via Paxos only) and
-  use *that* for the prepare/sync consistency check, leaving 2PC-decision appends out of the
-  comparison; OR
-- Gate sync on actual divergence of agreed state rather than raw log length.
-**Expected:** sync storms stop; current batching becomes a net win (should exceed baseline).
-**Verify:** re-run §5.2; confirm conservation still 1970 AND TPS jumps. (While debugging,
-temporarily re-add a `SYNC_APPLY` count log and confirm it drops to ~0 on healthy runs.)
+### What the measurements showed
+- **The "~190 TPS" was a harness artifact.** `correctness_check.sh` sleeps `0.04s`
+  between 50 small sets; the client's wall clock spans those idle gaps. Remove the
+  throttle and the same code does **~1.3k TPS**.
+- **Batches were size 1.** Instrumenting `startRound` showed *every* Paxos round
+  committed exactly one transaction (mean 1.0), even with the throttle removed —
+  the benchmark scatters each set across leaders and rounds finish before the next
+  txn reaches the same leader. So batching (the whole Phase 2 feature) was inert, and
+  **group-commit (old Step B) had nothing to coalesce.**
+- **Rounds are serialized** (`is_paxos_running` gate, single-threaded loop). At
+  batch=1, ~1.3k TPS is near the ceiling. The only way past it is to *fill batches*.
 
-### Step B — Phase 0 quick wins  (≈1–2 hrs)  ← the real fsync lever
-1. **Stop per-round ballot persistence.** `persistBallotNum()` is called every
-   `reissuePrepareForCurrent()` (LevelDB `Put` of `__ballot_num__`). Persist lazily /
-   batched, not on every round.
-2. **Group-commit durability.** Each `prepareTransaction`/`commitTransaction`/2PC decision
-   opens `std::ofstream(walFile, app)` and writes (flush per op), plus `updateBalance` does
-   a LevelDB `Put` per account. Coalesce a whole batch into **one** WAL append + **one**
-   LevelDB `WriteBatch` (single fsync per Paxos round instead of per command). This is what
-   batching is *supposed* to amortize.
-3. **Raise `RPC_TIMEOUT_MS`** (currently 10 ms) so accept/commit fan-out doesn't spuriously
-   time out under load.
-**Expected:** ~1.5–2.5k TPS.
+### What actually reached 10k — concurrent load (the old "Step C" was the lever)
+Offer many disjoint intra-shard transfers at once so `pending_` accumulates while a
+round is in flight, and spread them across all 3 clusters (each is an independent
+Paxos group with its own leader S1/S4/S7, so they batch in **parallel**):
+- `test/gen_load.py` builds one big set of 1500 disjoint transfers (500/cluster,
+  each client used once → no intra-batch lock conflicts, all succeed).
+- `test/load_benchmark.sh` feeds it with no throttle and checks conservation.
+- **Result: ~11k TPS (9k–14k across runs), conservation exact (30000).** Batches
+  filled to mean ~9, max ~100. **No group-commit needed.**
 
-### Step C — Offer enough concurrent load to fill batches  (≈30 min, harness/client)
-The harness throttles with `sleep 0.04` between sets, so batches stay tiny (≈ set size).
-Batching only pays off when each round carries many commands. Remove/shrink the throttle
-and/or run many concurrent in-flight clients so `pending_` actually accumulates.
-**Expected:** with A+B+C, batches grow → **~10k+ TPS** is realistic on this localhost 3×3.
+Reproduce (after `make server driver`, and §5.1 kill-zombies first):
+```bash
+python3 test/gen_load.py                  # writes test/load_3cluster1500.csv
+cd build && bash ../test/load_benchmark.sh
+```
 
-### Step D (optional) — Phase 1: stable-leader Multi-Paxos  (≈half day)
-Add a leader lease/stable ballot so the hot path is **Accept + Commit only** (skip Prepare),
-falling back to Prepare on conflict. Stacks on top of batching for another ~2×. Medium risk
-(leader-change edge cases, recovery).
+### Done
+- **Step A — spurious sync fix: DONE** (commit `1bfdefb`). Added `paxos_index`
+  (counts Paxos-agreed appends only) and gated the prepare/sync trigger on it instead
+  of the raw `last_inserted`, which drifts because async 2PC-decision/abort appends
+  interleave differently per replica. `SYNC_APPLY` 474 → 0; conservation still 1970.
+- **Load benchmark + `RPC_TIMEOUT_MS` 10→200ms: DONE** (commit `d84fb10`).
 
-**Why this order:** A unblocks the gain that's already implemented; B removes the dominant
-per-txn cost; C makes batches large enough for B to amortize; D is extra headroom.
+### Optional future work (NOT required for 10k)
+- **Group-commit (old Step B2):** coalesce a batch's WAL writes into one
+  `std::ofstream` open/close and its LevelDB `Put`s into one `WriteBatch`. Only worth
+  it once batches are large (they now are under load); buys cleaner durability and a
+  bit more headroom past ~14k. Note neither path currently fsyncs, so today it saves
+  syscalls, not fsyncs.
+- **Stable-leader Multi-Paxos (old Step D):** skip Prepare on the hot path. ~2× more,
+  medium risk (leader-change/recovery edges).
+
+### Conservation-check caveat (not money loss)
+Under heavy load a client `Balance` read can exceed the client RPC deadline and print
+`-` (summed as 0), making `per_replica_total` read a few short (e.g. 29997). Intra-shard
+transfers are net-zero to the cluster total, so the in-store total is invariant — this
+is a read-timeout artifact. `load_benchmark.sh` attributes it on the status line.
 
 ---
 
@@ -245,14 +260,19 @@ per-txn cost; C makes batches large enough for B to amortize; D is extra headroo
 
 ---
 
-## 8. Immediate next action for the new session
+## 8. Status / next action for a new session
 
-1. **Commit the current correct state first** (it is verified-correct and must not be lost).
-   User requirement: **NO AI attribution anywhere** — no `Co-authored-by`, no Cursor/Claude
-   mention in the message or metadata. (Previously enforced with `git commit-tree` if a
-   trailer sneaks in.)
-2. Then start **Step A** (§6). Re-verify with §5.2 after every change, and **always do §5.1
-   (kill zombies) first**.
+**The 10k TPS goal is reached and pushed.** Current `main` tip is `d84fb10`
+(parent `1bfdefb` = Step A). There is no outstanding required work.
+
+- **Standing requirement:** **NO AI attribution anywhere** — no `Co-authored-by`, no
+  Cursor/Claude mention in any commit message or metadata. (Enforce with `git
+  commit-tree` if a trailer ever sneaks in.)
+- Always do **§5.1 (kill zombies) first** before any benchmark, and re-verify
+  conservation (§5.2 for the throttled check; `test/load_benchmark.sh` for the load
+  check) after any change.
+- If continuing for headroom past ~14k or cleaner durability, see the **optional
+  future work** in §6 (group-commit, then stable-leader). Neither is required for 10k.
 
 ---
 
