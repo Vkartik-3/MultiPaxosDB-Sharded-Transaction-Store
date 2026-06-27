@@ -24,9 +24,19 @@ A fault-tolerant distributed transaction processing system supporting a banking 
   - [2PC Lock Timeout](#3-2pc-lock-timeout)
   - [Configuration File Support](#4-configuration-file-support)
   - [Benchmark Instrumentation](#5-benchmark-instrumentation)
-- [Benchmark Results](#benchmark-results)
+  - [Batched Multi-Paxos Rounds](#6-batched-multi-paxos-rounds)
+  - [Idempotent Balance Application](#7-idempotent-balance-application)
+  - [Paxos-Only Sync Index](#8-paxos-only-sync-index)
+- [Performance & Benchmark Results](#performance--benchmark-results)
 - [Build & Run](#build--run)
 - [Project Structure](#project-structure)
+
+> **What's new in this version:** transactions are now committed in **batches** (many
+> per Paxos round), balance application is **idempotent per server** (money strictly
+> conserved), the catch-up sync is gated on a **Paxos-only index** (no spurious sync
+> storms), and a dedicated **concurrent load benchmark** demonstrates **~10,000 TPS**
+> on localhost. See [CHANGES.md](CHANGES.md) for the full engineering changelog and
+> [Performance & Benchmark Results](#performance--benchmark-results) for numbers.
 
 ---
 
@@ -54,7 +64,7 @@ The data is divided into three shards D1, D2, D3. Nine servers (S1–S9) are org
 
 ### Intra-Shard Transactions: Multi-Paxos
 
-For intra-shard transactions (both sender and receiver in the same cluster), the system runs a full Paxos round per transaction — no persistent log is assumed on startup (consensus is required for each transaction individually).
+For intra-shard transactions (both sender and receiver in the same cluster), the system reaches agreement via Multi-Paxos. A Paxos round can carry **a batch of many client commands at once** rather than a single transaction (see [Batched Multi-Paxos Rounds](#6-batched-multi-paxos-rounds)); the protocol below describes a round for clarity, but in practice each Prepare/Accept/Commit fan-out commits the whole batch accumulated since the previous round.
 
 **Protocol flow:**
 
@@ -104,7 +114,7 @@ The client acts as the 2PC coordinator. Each involved cluster runs Paxos interna
 
 ### Write-Ahead Log (WAL)
 
-Each server maintains a plain-text append-only WAL (`S{id}.wal`) for 2PC durability. Four entry types:
+Each server maintains a plain-text append-only WAL (`wal_<id>.log`) for 2PC durability. Four entry types:
 
 | Entry Type  | When Written                                     | Format                                      |
 |-------------|--------------------------------------------------|---------------------------------------------|
@@ -134,14 +144,14 @@ This design eliminates data races entirely — no mutexes needed for in-memory s
 
 All communication uses **gRPC with async completion queues** (`ClientAsyncResponseReader`). The client submits RPCs non-blocking and processes replies via `consumeReplies()` on a dedicated thread. All peer-to-peer Paxos messages use unary RPCs.
 
-**RPC timeout**: Client-side deadline set to 10ms per RPC call. Unreachable servers are tracked and skipped.
+**RPC timeout**: The client uses a short deadline for its reads. **Peer-to-peer Paxos RPCs use a 200 ms deadline** (`RPC_TIMEOUT_MS`); it was raised from 10 ms because, on the single-threaded event loop, a peer busy in its own round can legitimately take longer than 10 ms to service an incoming Prepare/Accept, and exceeding the deadline counts the reply as a round *failure*. 200 ms is well above worst-case localhost service latency while still detecting a genuinely dead peer quickly (quorum needs only 1 of 2 peers). Unreachable servers are tracked and skipped.
 
 **Protocol Buffers 3** defines all message types: `TransferReq`, `TransferRes`, `TpcTid`, `Ballot`, `Empty`, and service `TpcServer`.
 
 ### Fault Tolerance
 
 - **Majority quorum**: 2-of-3 servers must respond for Paxos to proceed. One server failure per cluster is tolerated.
-- **State synchronization**: During the Prepare phase, servers compare `last_inserted_ballot`. The server with the stale state pulls the missing committed entry from the proposer before sending its Promise.
+- **State synchronization**: During the Prepare phase, servers compare a **Paxos-only log index** (`paxos_index`) rather than the raw log length. A server that is genuinely behind on agreed entries pulls the missing entries from the proposer (a `Sync` RPC) before participating. Using `paxos_index` instead of the raw index is important: 2PC-decision and lock-timeout entries are appended to the log asynchronously and interleave differently per replica, so the raw index drifts even when replicas agree — which previously triggered constant spurious syncs (see [Paxos-Only Sync Index](#8-paxos-only-sync-index)).
 - **Crash recovery**: On restart, a server reloads ballot number and balances from LevelDB, then replays WAL to restore pending 2PC state.
 - **2PC lock timeout**: Locks held by unresolved prepared transactions are automatically released after 5 seconds (server-side sweep in the event loop). This prevents permanent deadlock when the coordinator crashes after Phase 1.
 - **Disconnected servers**: The client tracks disconnected server addresses and skips them when routing requests.
@@ -229,27 +239,77 @@ Wall-clock throughput = `transactions_processed / (wall_end - wall_start)` in se
 - Intra-shard mean, p50, p99
 - Cross-shard mean, p50, p99
 
+### 6. Batched Multi-Paxos Rounds
+
+**Problem**: Driving one full Paxos round (6-RPC peer fan-out + WAL append + LevelDB writes) per client transaction makes the per-round fixed cost dominate throughput.
+
+**Fix**: A round now commits a **batch** of client commands. Incoming `TRANSFER` / `TPC_PREPARE` calls **park** themselves (`CallStatus::AWAIT_BATCH`) and enqueue into `pending_`. When no round is running, the accumulated `pending_` is swapped into the in-flight `current_` and proposed together; while that round runs, newly-arriving commands pile into `pending_` for the next round.
+
+- `pending_` / `current_` — `std::vector<BatchEntry>` for the next / in-flight round.
+- `is_paxos_running` — only **one round runs at a time** (rounds are serialized).
+- `AcceptReq.batch` and `PrepareRes.accept_val` became `repeated` to carry a batch.
+- Per-entry validation happens at prepare-quorum time: entries whose accounts are locked, that lack funds, or that conflict with an earlier entry in the same batch are rejected individually; survivors are locked and proposed in one Accept. Intra-shard entries commit and release locks at accept-quorum; cross-shard entries reply `PREPARED` and keep locks until the 2PC decision.
+- `InCall::completeTransfer(ack, tid)` finishes each parked client RPC once its batch round is decided.
+
+**Key consequence**: batching only helps when a round actually carries many commands. With the throttled correctness workload, each round commits exactly one transaction; large batches require **concurrent offered load** to a leader (see [Performance & Benchmark Results](#performance--benchmark-results)).
+
+### 7. Idempotent Balance Application
+
+**Problem**: After batching, the total of all balances drifted from the invariant `N × 10` — money was created or destroyed. The residual root cause (after eliminating stale "zombie" server processes) was **non-idempotent balance application during catch-up sync**: a `Sync` re-shipped committed entries and the receiver re-applied their balances, double-counting.
+
+**Fix**: A per-server set `std::set<long> balance_applied` (keyed by transaction id) makes balance movement **apply at most once per server**. All three balance-moving paths guard on it:
+- `commitTransaction()` (intra-shard commit) — early-return if already applied.
+- `processTpcDecision()` (cross-shard 2PC commit) — guard the debit/credit (locks still released unconditionally).
+- `handleSyncReply()` (catch-up) — guard the committed-entry debit/credit.
+
+This is the **#1 correctness invariant**: `sum(balances) == N × 10` at all times, verified by summing every touched client's balance across all 3 replicas after a run.
+
+> Note: `balance_applied` grows unbounded over a very long run; fine for benchmarks, bounded/checkpointed in production (same caveat as `wal.transferIndex`).
+
+### 8. Paxos-Only Sync Index
+
+**Problem**: The consistency check that decides whether a replica must catch up compared `last_inserted` — the **raw** index into the heterogeneous log. But `processTpcDecision` (`CS_COMMIT`/`CS_ABORT`) and the lock-timeout sweep append to the log **without** bumping `last_inserted`, and these appends happen **asynchronously and independently** on each replica. The next Paxos append then jumps `last_inserted` over them by a replica-dependent amount, so replicas that agreed on the *identical* Paxos sequence ended up with *different* `last_inserted` values. The check read that as divergence and fired **catch-up syncs constantly** (a re-apply path fired up to ~474 times in a 200-txn run).
+
+**Fix**: A separate counter `paxos_index` is incremented **by exactly one per Paxos-agreed append** (`prepareTransaction`, `commitTransaction`, and per Paxos-type entry applied during sync) and **never** by 2PC-decision or lock-timeout appends. A helper `isPaxosEntry()` classifies an entry as Paxos-agreed (`INTRA && COMMITTED` or `CROSS && PREPARED`); recovery recomputes `paxos_index` by counting those. The Prepare/Sync **trigger** now compares `paxos_index`; the sync **payload** still ranges over the raw log via `last_inserted`. To keep the two roles unambiguous, the proto field `PrepareReq/PrepareRes.last_inserted` was renamed to `paxos_index` (the separate `SyncReq.last_inserted` is unchanged).
+
+**Result**: spurious catch-up applies dropped from **~474 → 0** per run while conservation held — eliminating wasted CPU and round latency from sync churn.
+
 ---
 
-## Benchmark Results
+## Performance & Benchmark Results
 
-Benchmarks run on a single machine (macOS, Apple Silicon), 9 local server processes, 3 clusters × 3 servers each. Mix of intra-shard and cross-shard transactions from the test CSV.
+All numbers below are on a single machine (macOS, Apple Silicon), 9 local server processes, 3 clusters × 3 servers each.
 
-| Run | Txns | Wall (s) | TPS   | p50 (ms) | p99 (ms) | Intra Mean (ms) | Intra p99 (ms) | Cross p50 (ms) | Cross p99 (ms) |
-|-----|------|----------|-------|----------|----------|-----------------|----------------|----------------|----------------|
-| 1   | 102  | 2.86     | 35.65 | 98.08    | 483.63   | 78.23           | 483.63         | 146.91         | 525.61         |
-| 2   | 134  | 4.06     | 32.97 | 98.44    | 600.32   | 84.17           | 601.89         | 127.08         | 600.32         |
-| 3   | 124  | 3.18     | 38.96 | 160.61   | 946.43   | 108.40          | 971.28         | 247.01         | 946.43         |
-| 4   | 138  | 3.53     | 39.10 | 158.23   | 901.99   | 143.62          | 998.12         | 160.74         | 597.20         |
-| 5   | 128  | 3.11     | 41.14 | 215.45   | 1250.12  | 132.77          | 1257.04        | 294.16         | 1250.12        |
+### Two benchmarks — do not mix them
 
-**Summary (averages across 5 runs):**
-- Throughput: ~37.6 TPS
-- p50 latency: ~146 ms
-- p99 latency: ~836 ms
-- Cross-shard transactions have roughly 1.5–2× higher latency than intra-shard due to two sequential Paxos rounds plus the coordinator round-trip.
+| Harness | What it measures | Typical TPS |
+|---|---|---|
+| `build/correctness_check.sh` *(local)* | Throttled (`sleep 0.04` between 50 small sets), money conservation | ~185–200 |
+| `test/load_benchmark.sh` | 1500 concurrent **disjoint intra-shard** transfers across all 3 clusters, no throttle | **~8,000–14,000** |
 
-The p99 variance across runs reflects contention on hot accounts and lock serialization under the 2PL protocol.
+"The system does ~10k TPS" refers to the **load benchmark** (or any equivalent offered concurrent load), **not** the throttled correctness script.
+
+### Why the throttled number is not the ceiling
+
+The correctness harness sleeps between sets, so the client's wall-clock timer spans idle gaps — the reported ~190 TPS reflects the **throttle**, not the system. With the throttle removed, the same binary does **~1.3k TPS**. At that point throughput is capped because (a) rounds are **serialized** (`is_paxos_running`) and (b) the standard workload scatters each set across leaders so every round commits **exactly one** transaction (batch size 1). Group-commit / fsync batching cannot help while batches are size 1 — there is nothing to coalesce.
+
+### Reaching ~10k TPS — fill the batches with concurrent load
+
+Each cluster is an **independent Paxos group** with its own leader (S1, S4, S7), so they batch **in parallel**. Offering many concurrent disjoint intra-shard transfers makes `pending_` accumulate while a round is in flight, so subsequent rounds commit large batches:
+
+| Run | Txns | TPS    | per_replica_total | Expected |
+|-----|------|--------|-------------------|----------|
+| 1   | 1500 | 11,765 | 30,000            | 30,000   |
+| 2   | 1500 | 11,732 | 29,997¹           | 30,000   |
+| 3   | 1500 |  9,265 | 30,000            | 30,000   |
+| 4   | 1500 | 10,043 | 30,000            | 30,000   |
+| 5   | 1500 | 14,083 | 30,000            | 30,000   |
+
+Batches fill to a mean of ~9 commands (max ~100) per round, and aggregate throughput across the three leaders reaches **~10k TPS with money strictly conserved** — achieved **without any group-commit change**.
+
+> ¹ A `per_replica_total` a few short (e.g. 29,997) is **not** money loss. Under heavy load a client `Balance` read can exceed the client RPC deadline and print `-` (summed as 0). Because intra-shard transfers are net-zero to the cluster total, the in-store total is a mathematical invariant; `load_benchmark.sh` attributes these read-timeout undercounts on its status line, and a re-run reads exactly 30,000.
+
+See [CHANGES.md](CHANGES.md) §6 for the full investigation.
 
 ---
 
@@ -314,13 +374,13 @@ cd build
 Example (3 clusters, 3 servers each):
 
 ```bash
-./driver 3 3 ../test/transactions.csv
+./driver 3 3 ../test/benchmark.csv
 ```
 
 With a custom address config:
 
 ```bash
-./driver 3 3 ../test/transactions.csv ../test/config.txt
+./driver 3 3 ../test/benchmark.csv ../test/config.txt
 ```
 
 **Config file format** (`config.txt`):
@@ -341,18 +401,34 @@ S9  localhost:50059
 
 | Command              | Description                                      |
 |----------------------|--------------------------------------------------|
-| `process`            | Read and process the next transaction set        |
+| `processNextSet`     | Read and process the next transaction set        |
 | `printBalance <id>`  | Print balance of client with given ID            |
 | `printDatastore`     | Print all balances across the cluster            |
 | `printPerformance`   | Print throughput and latency statistics          |
 | `exit`               | Shut down all servers and exit                   |
 
-**Clean up between runs** (if restarting after a crash):
+**Clean up between runs** (always do this before any benchmark — stale "zombie" server processes from a crashed run keep the ports and poison every measurement):
 
 ```bash
-pkill -9 -f "build/server"
-rm -rf S{1..9}_db S{1..9}.wal
+pkill -9 -f "server S"
+cd build && rm -rf S{1..9}_db wal_*.log
 ```
+
+### Run the throughput (load) benchmark
+
+Generate the high-concurrency workload, then run it from `build/`:
+
+```bash
+cd 2pc
+python3 test/gen_load.py                  # writes test/load_3cluster1500.csv (1500 disjoint intra-shard txns)
+cd build
+make server driver                        # if not already built
+bash ../test/load_benchmark.sh            # ~8k–14k TPS; verifies per_replica_total == 10 * clients
+```
+
+Each line of output reports `tps`, `processed`, and `per_replica_total` vs `expected`, with an `OK`/`CHECK` status (a `CHECK` attributable to a balance-read timeout is a measurement artifact, not money loss — see [Performance & Benchmark Results](#performance--benchmark-results)).
+
+`gen_load.py` takes optional args: `python3 test/gen_load.py [pairs_per_cluster] [out.csv]` (default 500 pairs/cluster → 1500 transfers).
 
 ---
 
@@ -361,36 +437,41 @@ rm -rf S{1..9}_db S{1..9}.wal
 ```
 2pc/
 ├── src/
-│   ├── driver.cc                   # Entry point: CLI driver, mainloop
+│   ├── driver.cc                   # Entry point: CLI driver, EOF-safe mainloop
 │   ├── constants.h                 # Cluster/shard mapping constants
+│   ├── proto/
+│   │   └── tpc.proto               # Protobuf service + messages (batched Accept/Promise, paxos_index)
 │   ├── client/
-│   │   ├── client.h                # Client class: stubs, latency tracking
+│   │   ├── client.h                # Client class: stubs, latency tracking, state_mtx
 │   │   └── client.cc               # processTransactions, consumeReplies, printPerformance
 │   ├── server/
-│   │   ├── server.h                # ServerImpl: state, ballot, locks, timers
-│   │   ├── server.cc               # HandleRPCs event loop, Paxos phases, 2PC logic
-│   │   ├── wal.h                   # WAL interface
-│   │   ├── wal.cc                  # WAL read/write/recover
-│   │   ├── in_call.cc              # Incoming async RPC call wrappers
-│   │   └── out_call.cc             # Outgoing async RPC call wrappers
+│   │   ├── server.h                # ServerImpl: batched-round state, balance_applied, paxos_index
+│   │   ├── server.cc               # HandleRPCs loop, batched Paxos phases, 2PC, idempotency guards
+│   │   ├── wal.h / wal.cc          # WAL read/write/recover
+│   │   ├── in_call.cc              # Incoming async RPC wrappers (AWAIT_BATCH, completeTransfer)
+│   │   └── out_call.cc             # Outgoing async RPC wrappers
 │   ├── types/
 │   │   └── types.h                 # Shared type definitions (WALEntry, Transaction, etc.)
 │   └── utils/
-│       ├── utils.h / utils.cc      # Setup, server launch, loadConfig
+│       ├── utils.h / utils.cc      # Setup, server launch, loadConfig, killAllServers
 │       ├── csv_reader.h / .cc      # CSV transaction set parser
 │       └── commands_parser.h / .cc # CLI command parser
-├── protos/
-│   └── tpc.proto                   # Protobuf service and message definitions
-├── third_party/
-│   ├── leveldb/                    # LevelDB submodule
-│   └── spdlog/                     # spdlog submodule
 ├── test/
-│   └── transactions.csv            # Example transaction workload
-├── build/
-│   └── metrics_5runs.tsv           # Benchmark results (5 runs)
+│   ├── benchmark.csv               # Standard mixed workload (used by correctness_check.sh)
+│   ├── gen_load.py                 # Generator for the high-concurrency load workload
+│   ├── load_benchmark.sh           # ~10k-TPS throughput + conservation benchmark
+│   ├── load_3cluster1500.csv       # Generated 1500-txn disjoint workload (3 clusters)
+│   └── run_benchmark.sh            # Throttled multi-run benchmark over benchmark.csv
 ├── CMakeLists.txt
-└── common.cmake
+├── common.cmake
+├── README.md
+├── HANDOFF.md                      # Work handoff: status, gotchas, plan history
+└── CHANGES.md                      # Detailed engineering changelog of all changes
 ```
+
+> LevelDB and spdlog are vendored under `src/thirdparty/` (git-ignored) and built by
+> CMake. The `build/` directory is also git-ignored; `correctness_check.sh` lives there
+> locally and is the throttled conservation harness referenced above.
 
 ---
 
@@ -401,3 +482,5 @@ rm -rf S{1..9}_db S{1..9}.wal
 **Why LevelDB over WAL for balances?** The WAL is append-only and was designed for 2PC durability (rollback support), not as an authoritative balance store. LevelDB provides O(1) point lookups with crash-safe writes. On recovery, LevelDB gives the correct committed balance directly; the WAL is only scanned to rebuild the pending-prepare index and Paxos metadata.
 
 **Why system_clock for intra-shard latency?** The TID doubles as a timestamp (nanoseconds since epoch). Because `system_clock` is used at submission and the server echoes TID back in the reply, measuring `system_clock::now() - tid` on the client gives correct end-to-end latency without storing per-transaction state on the client for intra-shard transactions. Cross-shard uses `steady_clock` for intervals since the coordinator stores `start_ns` explicitly.
+
+**Why was concurrent load — not group-commit — the throughput lever?** Because rounds are serialized (one at a time per leader), the only way to beat the per-round cost is to commit many commands per round. But batching is inert unless commands actually queue at a leader while a round is in flight. The standard workload never does that (it scatters transfers across leaders behind a throttle), so every round committed exactly one transaction and group-commit had nothing to coalesce. Offering concurrent disjoint load — and spreading it across the three independent cluster-leaders so they batch in parallel — fills the batches on its own and reaches ~10k TPS. Group-commit (one WAL append + one LevelDB `WriteBatch` per round) remains a worthwhile *future* optimization once batches are large, but it is not required to hit the goal. See [CHANGES.md](CHANGES.md) for the full analysis.
